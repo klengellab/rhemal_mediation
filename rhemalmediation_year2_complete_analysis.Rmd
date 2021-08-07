@@ -1,0 +1,1019 @@
+---
+title: "Rhesus macaque year 2 infant maltreatment study - mediation analysis"
+author: "M.N.C.A. Smulders"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup-processing, cache=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(stringsAsFactors = FALSE)
+set.seed(13)
+
+# Set input
+dataDirectory <- "/data/humgen/klengellab/rhesus_maltreatment/idats"
+sampleSheet <- "/data/humgen/klengellab/rhesus_maltreatment/Torsten_SampleTable.csv"
+phenoFile <- "/data/humgen/klengellab/rhesus_maltreatment/0_mergedsamples06102018.batched.xlsx"
+rhesusAnnotFile <- "/data/humgen/klengellab/rhesus/epic/rhe-rheMac10-annotated-probes-v4.bed"
+outDirectory <- "/data/humgen/klengellab/Michelle/out-year2-v1"
+pn <- "rhemal-year2-"
+v <- "-v1"
+
+# Load packages required for analysis
+cran <- c("knitr", "kableExtra", "openxlsx", "irlba", "dplyr", "Hmisc", "Rmisc", "pheatmap")
+bioc <- c("minfi", "wateRmelon", "FlowSorted.Blood.EPIC", "ChAMP","IlluminaHumanMethylationEPICanno.ilm10b2.hg19","ENmix","minfiDataEPIC", "FDb.InfiniumMethylation.hg19")
+
+install.cran <- !unlist(lapply(cran, library, character.only = TRUE, logical.return = TRUE))
+install.bioc <- !unlist(lapply(bioc, library, character.only = TRUE, logical.return = TRUE))
+if(sum(install.cran) > 0){
+    invisible(lapply(cran[install.cran], install.packages, method = "curl", repos='http://cran.us.r-project.org'))
+}
+if(sum(install.bioc) > 0){
+    invisible(lapply(bioc[install.bioc], BiocManager::install, method = "curl"))
+}
+invisible(lapply(c(cran, bioc), require, character.only = TRUE, quietly = TRUE))
+rm(cran, bioc, install.cran, install.bioc)
+
+# install.packages("devtools")
+library(devtools)
+
+# Source custom scripts
+source("/data/humgen/klengellab/scripts/predictSex2.R") # This modified version of predictSex() also makes a plot colored by reported sex
+source("/data/humgen/klengellab/scripts/reproducibleBMIQ.R") # A modified version of the waterMelon::BMIQ function that is reproducible (has a fixed random seed value)
+source("/data/humgen/klengellab/scripts/custom.QC.R") # A modified version of champ.QC() with better plots
+source("/data/humgen/klengellab/scripts/custom.impute.R") # A fixed version of champ.impute() that correctly adjusts the k parameter
+source("/data/humgen/klengellab/scripts/mdsPlot2.R") # A modified version of mdsPlot() from minfi with better control of the legend placement
+source("/data/humgen/klengellab/scripts/custom.PCA.R") # A heavily modified version of champ.SVD()
+source("/data/humgen/klengellab/scripts/estimateCellCounts2Fixed.R") # A fixed version of estimateCellCounts2()
+
+# # Set working directory
+# if(!dir.exists(outDirectory)) dir.create(outDirectory)
+# knitr::opts_knit$set(root.dir = outDirectory)
+# setwd(outDirectory)
+```
+
+# Introduction
+
+This script is used to perform a mediation analysis on rhesus macaque data. It explores a potential mediation relationship between infant maltreatment, DNA methylation and cortisol levels, with DNA methylation at certain sites as the mediator.
+
+# Processing
+
+```{r load-data}
+# Read in sample sheet
+targets <- read.csv(sampleSheet)
+
+# Construct basename column
+targets$Basename <- paste0(targets$Sentrix.Barcode, "_", targets$Sample.Section)
+
+# Set as rownames (so they are the same as the EPIC data)
+rownames(targets) <- targets$Basename
+
+# Load phenotype data
+pheno <- read.xlsx(phenoFile, sheet = 2)
+message(paste0("There are ", nrow(pheno), " samples in the phenotype data."))
+message(paste0("These belong to ", length(unique(pheno$animal_code)), " unique animals."))
+
+# Restore target sample IDs to format in phenotype file
+targets$Sample.ID <- gsub("_", "-", targets$Sample.ID)
+
+# How many target samples in the phenotype data?
+message(paste0("There are ", nrow(targets), " samples with EPIC array data."))
+message(paste0(sum(targets$Sample.ID %in% pheno$Mar_code), " of these are included in the phenotype data."))
+
+# Which samples are missing?
+message("The samples not in the phenotype data are: ")
+targets$Sample.ID[!(targets$Sample.ID %in% pheno$Mar_code)]
+# "4-100" "4-50"
+
+# Select samples in the phenotype file
+targets <- targets[targets$Sample.ID %in% pheno$Mar_code,]
+
+# Merge targets and phenotype data, select relevant columns
+pd <- distinct(merge(x = targets[, c("Sample.ID", "Sentrix.Barcode",
+                                     "Sample.Section", "Basename",
+                                     "Sample_Well", "Sample_Plate")],
+                     y = pheno[, 1:11], by.x = "Sample.ID", by.y = "Mar_code"))
+rownames(pd) <- pd$Basename
+
+message("Only samples with array data and phenotype are included.")
+message(paste0("This leaves samples for ", length(unique(pd$animal_code)), " unique animals."))
+
+# Create new timepoint variable, only including actual timepoints
+pd$timepoint <- pd$timepoint_char
+pd$timepoint[grep("dex|DEX", pd$timepoint)] <- NA
+
+# Which cases are not complete?
+missing <- data.frame(pd$Sample.ID, pd$timepoint_char, pd$animal_code,
+                      pd$sex, pd$biol_mother, pd$foster_mother, pd$timepoint,
+                      row.names = rownames(pd))
+complete <- rownames(missing)[complete.cases(missing)]
+missing <- missing[!complete.cases(missing),]
+
+# Subset complete cases
+pd <- pd[complete,]
+message("Additionally, only samples with non-missing timepoint, animal code, sex, biological mother and foster mother data are selected.")
+message(paste0("This leaves ", nrow(pd), " samples for ", length(unique(pd$animal_code)), " unique animals."))
+rm(missing, complete, pheno, targets)
+
+# Make sure columns have the correct classes (i.e. numerical variables will be differently interpreted from categorical variables)
+#str(pd)
+pd$timepoint_char <- NULL
+pd$sex <- as.factor(pd$sex)
+pd$biol_mother <- as.factor(pd$biol_mother)
+pd$rank_biol_mother <- factor(pd$rank_biol_mother, 
+                              levels = c("low", "middle", "high"), 
+                              ordered = TRUE)
+pd$foster_mother <- as.factor(pd$foster_mother)
+pd$rank_foster_mother <- factor(pd$rank_foster_mother, 
+                                levels = c("low", "middle", "high"), 
+                                ordered = TRUE)
+pd$dob <- convertToDate(pd$dob)
+pd$extraction_date <- convertToDate(pd$extraction_date)
+pd$low_dna <- as.factor(pd$low_dna)
+pd$Sample_Plate <- as.factor(pd$Sample_Plate)
+pd$Sample_Well <- as.factor(pd$Sample_Well)
+pd$Sentrix.Barcode <- as.factor(pd$Sentrix.Barcode)
+pd$Sample.Section <- as.factor(pd$Sample.Section)
+pd$timepoint <- gsub("Month 22|Month 23|Month 24|Month 25|Month 26|Month 27",
+                     "Year 2", pd$timepoint)
+pd$timepoint <- gsub("HI pre", "Year 4", pd$timepoint)
+pd$timepoint <- gsub("CSF|CSF/AM|AM/CSF", "Year 5", pd$timepoint)
+pd$timepoint <- factor(pd$timepoint,
+                       levels = c("Day 2", "Week 2", "Month 1", 
+                                  "Month 3", "Month 6", "Year 2", 
+                                  "Year 4", "Year 5"),
+                       ordered = TRUE)
+
+# Subset year 2 data
+pd <- pd[pd$timepoint == "Year 2",]
+message(paste0("Looking only at the year 2 data, there remain ", nrow(pd), " samples."))
+
+# Sample overview
+addmargins(table(pd[, c("sex", "biol_mother")]))
+addmargins(table(pd[, c("sex", "foster_mother")]))
+
+# Save phenotype data
+save(pd, file = paste0(pn, "phenotype-data", v, ".RDa"))
+
+# Load annotation file
+annot <- read.delim(rhesusAnnotFile)
+rownames(annot) <- annot$name
+```
+
+## Preprocessing
+
+### Read in IDAT files
+
+```{r read-idat}
+# # Read in raw data as MethyLumiSet
+# mlumi <- readEPIC(idatPath = dataDirectory,
+#                    barcodes = pd$Basename,
+#                    parallel = TRUE, # setting to TRUE results in error
+#                    n = TRUE, # for beadcounts
+#                    oob = TRUE) # for out-of-bands signals
+
+
+# # Read in raw data as RGset
+#rgSet <- read.metharray.exp(base = dataDirectory,
+#                             targets = pd, verbose = TRUE)
+
+# # Save raw data
+# save(mlumi, rgSet, pd, file = paste0(pn, "raw-data", v, ".RData"))
+
+# Load raw data 
+load(file = paste0(pn, "raw-data", v, ".RData"))
+
+message("Dimensions of MethyLumiSet: ")
+dim(mlumi)
+# Features  Samples
+# 866150       38
+
+message("Dimensions of RGset: ")
+dim(rgSet)
+# 1051815      38
+```
+
+### Selection of succesfully mapped probes
+
+```{r filter-mapped-probes}
+mlumi.rhe <- mlumi[rownames(annot),]
+```
+
+When selecting only probes successfully and uniquely mapped to the macaque genome, with no mismatches within 5 bp of the target site, `r nrow(mlumi.rhe)[[1]]` remain. 
+
+### Sex prediction
+
+```{r sex-prediction, message=FALSE, warning=FALSE}
+pd$pred.sex <- predictSex2(betas(mlumi.rhe), x.probes = annot$chrom == "chrX", reported.sex = pd$sex)
+kable(table(pd$sex, pd$pred.sex)) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "200px")
+```
+
+There are `r sum(pd$Sex != pd$pred.sex)` sex mismatches.
+
+### Filtering of sex chromosome probes
+
+```{r unused-probes-filtering}
+XYprobes <- grepl("chrX|chrY", annot$chrom)
+mlumi.rhe <- mlumi.rhe[!(XYprobes),]
+```
+
+There are `r sum(XYprobes)` probes mapping to the X and Y chromosomes that were removed.
+
+### Filtering of samples based on bisulfite conversion
+
+```{r bscon}
+bsc <- bscon(mlumi.rhe)
+hist(bsc, col = rainbow(1))
+abline(v = 90, col = "green")
+mlumi.filt <- mlumi.rhe[, bsc > 90]
+pd <- pd[colnames(mlumi.filt),]
+```
+
+The current threshold is a 90% conversion rate, resulting in the exclusion of `r sum(bsc < 90)` sample(s). Note that the [*wateRmelon*](https://bioconductor.org/packages/release/bioc/vignettes/wateRmelon/inst/doc/wateRmelon.pdf) package vignette recommends as lowest threshold 80%.
+
+### Filtering of probes and samples based on detection p-value and beadcount
+
+```{r pfilter, message=TRUE}
+barplot(colMeans(pvals(mlumi.filt)), ylab = "mean detection p-value",
+        main = "mean detection p-value before filtering", names.arg = pd$Sample_Name,
+        cex.names = 0.5, ylim = c(0, 0.1))
+abline(h = 0.05, col = "red")
+# abline(h = 0.01, col = "green")
+
+mlumi.filt <- pfilter(mlumi.filt,
+                      perCount = 5, # percentage threshold of samples with beadcount < 3
+                      pnthresh = 0.05, # threshold for detection p-value
+                      perc = 5, # percentage threshold of probes with detection p > pntthresh, default is 1
+                      pthresh = 5) # percentage threshold of samples with detection p > pnthresh, default is 1
+
+barplot(colMeans(pvals(mlumi.filt)), ylab = "mean detection p-value",
+        main = "mean detection p-value after filtering", names.arg = pd[colnames(mlumi.filt), "Sample_Name"],
+        cex.names = 0.5, ylim = c(0, 0.1))
+abline(h = 0.05, col = "red")
+# abline(h = 0.01, col = "green")
+
+pd <- pd[colnames(mlumi.filt),]
+```
+
+### Outlyx outlier detection
+
+Outlier detection based on 2 outlier detection methods, part of the [wateRmelon](https://bioconductor.org/packages/release/bioc/vignettes/wateRmelon/inst/doc/wateRmelon.pdf) package. Outliers are detected based on i) > 2 interquartile ranges from the first principal component and ii) the [`pcout`](https://www.rdocumentation.org/packages/mvoutlier/versions/2.0.9/topics/pcout) function. From the documentation: this function uses robustly sphered data to compute semi-robust principal components, used for determining distances for each observation. Separate weights for location and scatter outliers are computed based on these distances. The combined weights are used for outlier identification.
+
+```{r outlyx}
+outliers <- outlyx(mlumi.filt, iqr = TRUE, iqrP = 2, pc = 1, mv = TRUE, mvP = 0.15, plot = TRUE)
+if(sum(outliers$outliers) > 0){
+    kable(outliers[outliers$outliers,])
+}
+```
+
+Using this method, `r sum(outliers$outliers)` outlying samples were detected.
+
+### Visual inspection of filtered data
+
+```{r filtered-qc, message=FALSE, warning=FALSE}
+custom.QC(betas(mlumi.filt), pheno = pd$foster_mother, PDFplot = TRUE, 
+          main = "All samples after filtering", leaves_cex = 0.5, 
+          labels_cex = 0.5, legendTitle = "foster_mother", legendInset = c(0, 0))
+```
+
+After filtering and outlier detection, `r ncol(mlumi.filt)[[1]]` samples and `r nrow(mlumi.filt)[[1]]` probes remain.
+
+```{r save-filtered-data}
+# rgSet.filt <- subsetByLoci(rgSet, includeLoci = rownames(mlumi.filt))
+# rgSet.filt <- rgSet.filt[, colnames(mlumi.filt)]
+# save(mlumi.filt, rgSet.filt, pd, file = paste0(pn, "filtered-data", v, ".RData"))
+
+load(paste0(pn, "filtered-data", v, ".RData"))
+```
+
+### Normalization
+
+The data is normalized using the QN.BMIQ approach (quantile normalization, followed by beta-mixture quantile normalization), as recommended by [Wang et al. (2015)](https://doi.org/10.1080/15592294.2015.1057384).
+
+```{r normalization, message=FALSE, warning=FALSE}
+mlumi.qn.bmiq <- reproducibleBMIQ(normalizeMethylation.quantile(mlumi.filt))
+```
+
+#### Visual inspection of normalized data
+
+```{r normalized-qc, message=FALSE, warning=FALSE}
+custom.QC(betas(mlumi.qn.bmiq), pheno = pd$foster_mother, PDFplot = TRUE, 
+          main = "All samples after normalization", leaves_cex = 0.5, labels_cex = 0.5, 
+          legendTitle = "foster_mother", legendInset = c(0, 0))
+```
+
+#### Normalization violence
+
+Assess normalization violence (i.e. identify samples drastically changed after normalization). This is an indication something may be inherently wrong with a sample. In this case, no samples were removed.
+
+```{r normv}
+normv <- qual(betas(mlumi.qn.bmiq), betas(mlumi.filt))
+plot(normv[, 1:4], pch = 19)
+```
+
+### Probe-wise outlier detection and imputation
+
+Check for highly outlying signals (> 4 IQRs), which are likely caused by SNPs. For human datasets, known SNP data with allele frequencies is available to filter out probes associated with common SNPs. However, this data is currently not available for macaques and therefore this alternative approach is applied.
+
+```{r pwod, message=TRUE}
+betas.pwod <- pwod(betas(mlumi.qn.bmiq), mul = 4)
+#29117 probes detected. 
+```
+
+Note that the outlying values are set to NA; here there are `r sum(!complete.cases(betas.pwod))` (`r round(sum(!complete.cases(betas.pwod))/nrow(betas.pwod)*100, 2)`%) probes and `r sum(!complete.cases(t(betas.pwod)))` (`r round(sum(!complete.cases(t(betas.pwod)))/ncol(betas.pwod)*100, 2)`%) samples that have at least one NA value. These NA values can be imputed. However, be aware of the consequences. Imputing the values has as advantage that methods that do not accept such values can still be used and that these probes thus not need to be removed outright. The risk is obviously that imputed values may not represent reality. The "combine" method used here prevents imputation of values for probes with too many NA values to be reliable (used default of > 0.2, above which probes will be removed; for samples the threshold is > 0.1). The k-nearest neighbors algorithm is used for imputation (with k = 100). 
+
+```{r impute, message=FALSE, results=FALSE}
+betas.imp <- custom.impute(betas.pwod,
+                          pd = NULL,
+                          method = "Combine",
+                          k = 100,
+                          ProbeCutoff = 0.2,
+                          SampleCutoff = 0.1)
+```
+
+Using this procedure, `r ncol(betas.pwod) - ncol(betas.imp)` samples and `r nrow(betas.pwod) - nrow(betas.imp)` probes were removed.
+
+
+After probe-wise outlier detection and imputation, `r ncol(betas.imp)` samples and `r nrow(betas.imp)` probes remain.
+
+```{r save-normalized-data}
+# save(mlumi.qn.bmiq, betas.pwod, betas.imp, pd, file = paste0(pn, "qnbmiq-pwod-imp-data", v, ".RData"))
+
+load(paste0(pn, "qnbmiq-pwod-imp-data", v, ".RData"))
+rm(normv, outliers, bsc, XYprobes)
+```
+
+### Conversion to M values
+
+Convert beta values to M values through a logistic transformation. M values have better statistical properties ( [Du et al., 2010](https://doi.org/10.1186/1471-2105-11-587)) and will therefore be used for statistical testing. Since beta values are easier to interpret, they can still be used for plotting. Note that due to the nature of the transformation there can be no beta values of exactly 0 or 1, which will result in infinite M values. In the current dataset there are `r sum(betas.imp <= 0)` beta values <= 0 and `r sum(betas.imp >= 1)` beta values >= 1. These will be replaced by the lowest and highest beta values that are not 0 or 1, respectively (this approach is also used in the ChAMP pipeline, specifically the champ.runCombat function).
+
+```{r m-values}
+# Replace 0 and 1 values with lowest and highest values above 0 and below 1, respectively (this approach is also used in the 
+# ChAMP pipeline, specifically the champ.runCombat function)
+if(sum(betas.imp <= 0) > 0){
+  betas.imp[betas.imp <= 0] <- min(betas.imp[betas.imp > 0])
+}
+if(sum(betas.imp >= 1) > 0){
+  betas.imp[betas.imp >= 1] <- max(betas.imp[betas.imp < 1])
+}
+
+# Determine M-values for EWAS
+m <- beta2m(betas.imp)
+
+# Check distributions of M-values
+densityPlot(m, main = "M values")
+```
+
+
+```{r save-processed}
+b <- betas.imp
+save(m, b, pd, annot, file = paste0(pn, "processed-data", v, ".RDa"))
+rm(betas.imp, betas.pwod, cc, mlumi, mlumi.filt,rgSet.filt, mlumi.qn.bmiq, mlumi.rhe, rgSet)
+```
+
+# EWAS
+
+```{r setup-EWAS, cache=FALSE, message=FALSE, warning=FALSE}
+rm(list = ls(all = TRUE))
+options(stringsAsFactors = FALSE)
+set.seed(13)
+
+# Set input
+processedData <- "/data/humgen/klengellab/Michelle/out-year2-v1/rhemal-year2-processed-data-v1.RDa"
+rhesusAnnotFile <- "/data/humgen/klengellab/Michelle/out-all-v1/rhemal-all-annotation-data-v1.RDa"
+outDirectory <- "/data/humgen/klengellab/Michelle/out-year2-v1"
+masterfile <- "/data/humgen/klengellab/Michelle/EESND_Masterfile_Subjects-121314.xlsx"
+
+pn <- "rhemal-year2-"
+v <- "-v1"
+
+# Load packages required for analysis
+cran <- c("knitr", "kableExtra", "Hmisc", "Rmisc", "pheatmap", "qqman", "dplyr")
+bioc <- c("minfi", "wateRmelon", "FlowSorted.Blood.EPIC", "ChAMP", "sva", "limma", "bacon", "QCEWAS", "EnhancedVolcano", "GenomicRanges", "org.Mmu.eg.db", "missMethyl")
+install.cran <- !unlist(lapply(cran, library, character.only = TRUE, logical.return = TRUE))
+install.bioc <- !unlist(lapply(bioc, library, character.only = TRUE, logical.return = TRUE))
+if(sum(install.cran) > 0){
+    invisible(lapply(cran[install.cran], install.packages, method = "curl", repos='http://cran.us.r-project.org'))
+}
+if(sum(install.bioc) > 0){
+    invisible(lapply(bioc[install.bioc], BiocManager::install, method = "curl"))
+}
+invisible(lapply(c(cran, bioc), require, character.only = TRUE, quietly = TRUE))
+rm(cran, bioc, install.cran, install.bioc)
+library("xlsx")
+
+# Source custom scripts
+source("/data/humgen/klengellab/scripts/custom.QC.R") # A modified version of champ.QC() with better plots
+source("/data/humgen/klengellab/scripts/mdsPlot2.R") # A modified version of mdsPlot() from minfi with better control of the legend placement
+source("/data/humgen/klengellab/scripts/custom.PCA.R") # A heavily modified version of champ.SVD()
+source("/data/humgen/klengellab/scripts/monkeyGO-v2.R") # A modified version of missMethyl::gometh(), working with any probe annotation
+source("/data/humgen/klengellab/scripts/plotAssoc.R")
+
+# # Set working directory
+# if(!dir.exists(outDirectory)) dir.create(outDirectory)
+# knitr::opts_knit$set(root.dir = outDirectory)
+# setwd(outDirectory)
+```
+
+## Data overview
+
+```{r load-processed, message=FALSE, warning=FALSE}
+load(processedData)
+pd$cohort <- factor(pd$cohort, levels = c("2009","2010","2011","2012"))
+
+rm(annot)
+
+# Load new annotation file
+load(rhesusAnnotFile)
+rownames(annot) <- annot$name
+
+# Overview
+addmargins(table(pd[, c("foster_mother", "sex")]))
+table(pd$cohort)
+table(pd$rank_foster_mother)
+addmargins(table(pd[, c("rank_foster_mother", "sex")]))
+```
+
+The processed data contains `r nrow(pd)` samples and `r nrow(b)` probes.
+
+### Principal components analysis
+
+Perform a PCA with the M values to determine which variables are most influential.
+Variable descriptions:
+
+* rank_foster_mother: social rank of the foster mother. This rank tends to be passed on to offspring.
+* foster_mother: indicates whether the foster mother maltreates
+* rank_biol_mother: social rank of the biological mother. This rank tends to be passed on to offspring.
+* biol_mother: indicates whether the biological mother was maltreated
+* Neu: neutrophil cell type estimates
+* Mono: monocyte cell type estimates
+* Bcell: B cell cell type estimates
+* NK: natural killer cell type estimates
+* CD4T: CD4 T-cell (T helper) cell type estimates
+* CD8T: CD8 (cytotoxic) T-cell cell type estimates
+* dnamage: the DNA methylation age (see the "DNA methylation age" secton for more details)
+* dob: date of birth
+* sex: the sex of the animal (male/female)
+* low_dna: indicates whether the sample had a low DNA concentration before amplification
+* extraction_date: date DNA was extracted
+* Sample_Plate: the 96-wells plate (1-4) on which the samples were transported to the company running the EPIC arrays 
+* Sample.Section: the physical location of the sample on the EPIC chip (1-8); this may be relevant for e.g. washing steps
+* Sentrix.Barcode: the identifier of the EPIC chip; only 8 samples go on one chip, so `r length(unique(pd$Sentrix.Barcode))` chips were used
+
+The plot and p-values are adjusted for multiple testing using the Bonferroni correction (i.e. each p-value is multiplied by the number of cells in the plot).
+
+```{r pca-bonf, fig.height=10, fig.width=8, message=FALSE, warning=FALSE}
+pca.p <- custom.PCA(m,
+          pd = pd[, c("Sentrix.Barcode", "Sample.Section", "Sample_Plate", "extraction_date",
+                      "low_dna", "sex", "dob", "dnamage", "CD8T", "CD4T", "NK", "Bcell", "Mono", 
+                      "Neu", "biol_mother", "rank_biol_mother", 
+                      "foster_mother", "rank_foster_mother", "cohort")],
+          RGEffect = FALSE,
+          PDFplot = FALSE,
+          cex.axis = 0.7,
+          adjust.p = TRUE,
+          return.p = TRUE)
+kable(pca.p) %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+```
+
+<br/> <br/>
+The Bcell and Neu cell type appear to be most influential. Sample_Plate also seems to have quite a strong effect.
+
+### Surrogate variable analysis 
+
+Cell type appears to explain a relatively large part of the variation, I will therefore attempt to capture the cell type effects with SVA, while retaining the effects of foster_mother and sex. I'm using *limma*'s `wsva` implementation for the plot, but `sva` from the *sva* package for determining the SVs (using M values).
+
+
+```{r sva}
+design.rc <- model.matrix(~ foster_mother + sex + rank_foster_mother + cohort, data = pd)
+
+#sv.rc <- sva(m, mod = design.rc, mod0 = design.rc[, -2]) # number of significant SVs is 6
+
+tempsv <- wsva(m, design.rc, plot = TRUE)
+rm(tempsv)
+
+#save(sv.rc, file = paste0(pn, "svs-all-sites-fost-rc", v, ".RDa"))
+
+load(paste0(pn, "svs-all-sites-fost-rc", v, ".RDa"))
+colnames(sv.rc$sv) <- paste0("allSV", 1:ncol(sv.rc$sv))
+```
+
+There are `r sv.rc$n.sv` significant SVs when looking at foster mother with rank and cohort. In the plot it can be seen that the first SV explains by far the most variation, with the following 1 or 2 also explaining more than the others (and at least > 0.05).
+
+### Update model
+
+The main goal of this analysis is to investigate the impact of maltreatment of the foster mother on DNA methylation in the offspring. I will therefore use a model with foster_mother as the main predictor, and as covariates sex, rank, cohort and all significant SVs.
+
+```{r update-designs}
+design.sv.rc <- cbind(design.rc, sv.rc$sv)
+colnames(design.sv.rc) <- c("Intercept", "foster_mother", "sex", "rank_foster_mother1", "rank_foster_mother2","cohort1","cohort2","cohort3",paste0("sv", 1:ncol(sv.rc$sv)))
+```
+
+```{r save-processed-2}
+save(m, b, pd, design.sv.rc, annot, file = paste0(pn, "processed-data", v, ".RDa"))
+```
+
+## Differentially methylated positions (EWAS) 
+
+Perform a site-by-site EWAS, looking at the effect of maltreatment of the foster mother on DNA methylation. The model is described in more detail above. The analysis will be done with [*limma*](https://doi.org/10.1093/nar/gkv007), and [*bacon*](https://doi.org/10.1186/s13059-016-1131-9) will be used to control for bias and inflation.
+
+
+```{r probe-distance}
+# Modified version of GenomicRanges::distanceToNearest that properly distinguishes distances of 0 
+# (exact match) and 1 (directly adjacent match). The original function denotes both of these cases 
+# as having a distance of 0.
+realDistanceToNearest <- function(x, subject=NULL, ignore.strand=FALSE, ...) {
+  require(GenomicRanges)
+  
+  GRdistance <- function(x, y, ignore.strand=FALSE, ...) {
+    if (!isTRUEorFALSE(ignore.strand)) stop("'ignore.strand' must be TRUE or FALSE")
+    
+    IRdistance <- function(x, y) {
+          max_start <- pmax.int(start(x), start(y))
+          min_end <- pmin.int(end(x), end(y))
+          pmax.int(max_start - min_end, 0L)
+    }
+    
+    d <- IRdistance(ranges(x), ranges(y))
+    mismtch <- as.character(seqnames(x)) != as.character(seqnames(y))
+    if (any(mismtch)) d[mismtch] <- NA
+    if (!ignore.strand) {
+      idx <- as.numeric(strand(x)) + as.numeric(strand(y))
+      if (any(idx == 3))
+        d[idx == 3] <- NA
+    }
+    d
+  }
+  
+  if (is.null(subject)) {
+    x_nearest <- nearest(x, ignore.strand=ignore.strand, ...)
+    subject <- x
+  } else {
+    x_nearest <- nearest(x, subject, ignore.strand=ignore.strand, ...) 
+  }
+  
+  if (is(x_nearest, "Hits")) {
+    queryHits <- queryHits(x_nearest)
+    subjectHits <- subjectHits(x_nearest)
+  } else {
+    ## 'x_nearest' is Integer vector when select = arbitrary
+    queryHits <- seq_along(x)[!is.na(x_nearest)]
+    subjectHits <- x_nearest[!is.na(x_nearest)]
+  }
+
+  if (!length(subjectHits) || all(is.na(subjectHits))) {
+    Hits(nLnode=length(x), 
+         nRnode=length(subject),
+         distance=integer(0),
+         sort.by.query=TRUE)
+  } else {
+    distance <- GRdistance(x[queryHits], subject[subjectHits],
+                           ignore.strand=ignore.strand)
+    Hits(queryHits, subjectHits, length(x), length(subject), distance,
+         sort.by.query=TRUE)
+    }
+}
+annot.full <- annot
+annot <- annot[rownames(m),]
+annot.gr <- makeGRangesFromDataFrame(annot, start.field = "start", end.field = "start")
+probe.distances <- as.data.frame(realDistanceToNearest(annot.gr))
+rownames(probe.distances) <- names(annot.gr)
+```
+
+```{r ewas}
+# Perform linear regression using limma
+doEWAS <- function(data, design, coef, label, annotation, pn, v){
+    # Load packages
+    require(limma)
+    require(bacon)
+    require(QCEWAS)
+    require(EnhancedVolcano)
+  
+    # Limma fit
+    fit <- lmFit(data, design)
+    fit <- eBayes(fit)
+    
+    # Bacon adjustment
+    set.seed(707)
+    bc <- bacon((fit$coef/fit$stdev.unscaled/fit$sigma)[, coef])
+    print(bc)
+    if(length(coef)>1){
+      sort="F"
+    }
+    else{
+      sort="P"
+    }
+    
+    results <- limma::topTable(fit, coef = coef, number = Inf, 
+                               adjust.method = "fdr", sort.by = sort)
+    results$df <- fit[rownames(results),]$df.residual
+    results$baconT <- bacon::tstat(bc)[rownames(results), 1]
+    results$baconP <- bacon::pval(bc)[rownames(results), 1]
+    results$baconFDR <- p.adjust(results$baconP, method = "fdr")
+    if(length(coef)>1){
+      results$baconP2 <- bacon::pval(bc)[rownames(results), 2]
+      results$baconFDR2 <- p.adjust(results$baconP2, method = "fdr")
+    }
+    results$chrom <- annotation[rownames(results), "chrom"]
+    results$pos <- annotation[rownames(results), "start"]
+    results$strand <- annotation[rownames(results), "strand"]
+    results$cgi.feature <- annotation[rownames(results), "cpgIslandExt_feature"]
+    results$gene <- annotation[rownames(results), "ncbiRefSeq_name"]
+    results$gene.feature <- annotation[rownames(results), "ncbiRefSeq_feature"]
+    results$distance.to.nearest.probe <- probe.distances[rownames(results), "distance"]
+    results <- results[order(results$baconP),]
+    save(results, file = paste0(pn, label, "-full-results", v, ".RDa"))
+    
+     # Number of probes with p < 0.05
+    message(paste0("# probes p < 0.05 before adjustment: ", sum(results$P.Value < 0.05)))
+    message(paste0("# probes p < 0.05 after adjustment: ", sum(results$baconP < 0.05)))
+    
+    # Number of probes with FDR p < 0.05
+    message(paste0("# probes FDR p < 0.05 before adjustment: ", sum(results$adj.P.Val < 0.05)))
+    message(paste0("# probes FDR p < 0.05 after adjustment: ", sum(results$baconFDR < 0.05)))
+    
+    make_qqplot <- function(p, title){
+        qqman::qq(p, 
+                  main = paste0("QQ plot of ", title),
+                  sub = paste0("lambda: ", 
+                               round(P_lambda(p), 3)))
+    }
+    make_qqplot(results$P.Value, "limma p-values")
+    make_qqplot(results$baconP, "bacon p-values")
+    
+    make_phist <- function(p, title){
+        hist(p, main = paste0("Histogram of ", title), col = "violet", 
+             xlab = "p-value")
+    }
+    make_phist(results$P.Value, "limma p-values")
+    make_phist(results$baconP, "bacon p-values")
+    if(length(coef)==1){
+      make_volcano <- function(results, p, title){
+      print(EnhancedVolcano(results,
+                      lab = rownames(results),
+                      x = "logFC",
+                      y = p, 
+                      title = title))
+      }
+    make_volcano(results, "P.Value", "limma results")
+    make_volcano(results, "baconP", "bacon results")
+    }
+    
+    return(results)
+}
+```
+
+```{r ewas-fost-sv-rank-cohort}
+# Perform linear regression using limma
+results.sv.rc <- doEWAS(m, design.sv.rc, "foster_mother", "m-all-sv-foster_mother.rc", annot, pn, v)
+
+dmps.fost <- rownames(results.sv.rc[results.sv.rc$baconFDR < 0.05,])
+
+if(sum(results.sv.rc$baconFDR < 0.05) > 0){
+  kable(results.sv.rc[results.sv.rc$baconFDR < 0.05,], caption = "DMPs (sites with FDR &lt; 0.05)") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+} else{
+  kable(results.sv.rc[1:10,], caption = "Top 10 sites (none have FDR &lt; 0.05)") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% scroll_box(width = "100%", height = "400px")
+}
+```
+
+Of the `r sum(results.sv.rc$baconFDR < 0.05)` DMPs, `r sum(results.sv.rc$baconFDR < 0.05 & results.sv.rc$logFC > 0)` (`r round((sum(results.sv.rc$baconFDR < 0.05 & results.sv.rc$logFC > 0) / sum(results.sv.rc$baconFDR < 0.05)) * 100, 2)`%) showed increased methylation with when the foster mother was maltreated, while `r sum(results.sv.rc$baconFDR < 0.05 & results.sv.rc$logFC < 0)` (`r round((sum(results.sv.rc$baconFDR < 0.05 & results.sv.rc$logFC < 0) / sum(results.sv.rc$baconFDR < 0.05)) * 100, 2)`%) showed the opposite pattern.
+
+``` {r savedata}
+save(dmps.fost, file = paste0(pn, "EWAS-results", v, ".RDa"))
+``` 
+
+# Mediation
+
+```{r setup-mediation, cache=FALSE, message=FALSE, warning=FALSE}
+rm(list = ls(all = TRUE))
+options(stringsAsFactors = FALSE)
+set.seed(13)
+
+# Set input
+EWASdata.fost.rc <-  "/data/humgen/klengellab/Michelle/out-year2-v1/rhemal-year2-m-sv-foster_mother.rc-full-results-v1.RDa"
+processeddata <- "/data/humgen/klengellab/Michelle/out-year2-v1/rhemal-year2-processed-data-v1.RDa"
+rhesusAnnotFile <- "/data/humgen/klengellab/Michelle/out-all-v1/rhemal-all-annotation-data-v1.RDa"
+cortbloodFile <- "/data/humgen/klengellab/Michelle/EESND_Cortisol_Michelle.xlsx"
+corthairFile <- "/data/humgen/klengellab/Michelle/EESND_HairCortisol-allcohorts_Michelle.xlsx"
+behaviorFile <- "/data/humgen/klengellab/Michelle/EESND_behav&cognitive_outcomes.xlsx"
+
+outDirectory <- "/data/humgen/klengellab/Michelle/out-year2-v1"
+
+pn <- "rhemal-year2-"
+v <- "-v1"
+
+# Load packages required for analysis
+library("xlsx")
+library("lmerTest")
+library("mediation")
+library("kableExtra")
+library("rstatix")
+library("tidyverse")
+
+# # Set working directory
+# if(!dir.exists(outDirectory)) dir.create(outDirectory)
+# knitr::opts_knit$set(root.dir = outDirectory)
+# setwd(outDirectory)
+```
+
+```{r loading-data}
+# EWAS data 
+load(EWASdata.fost.rc)
+
+dmps.fost <- rownames(results[results$baconFDR < 0.05,])
+dmps.results <- results[dmps.fost,]
+dmps.results <- dmps.results[order(dmps.results$baconFDR),]
+dmps.results$probe <- rownames(dmps.results)
+rownames(dmps.results) <- c(1:nrow(dmps.results))
+dmps.results.fost <- dmps.results[,c(18,1:17)]
+rm(results,dmps.results)
+
+# Cortisol data
+cort.blood <- read.xlsx(cortbloodFile, 3)
+colnames(cort.blood)[12] <- "AM.DEX"
+colnames(cort.blood)[13] <- "PM.DEX"
+cort.hair <- read.xlsx(corthairFile, 1)
+colnames(cort.hair)[11] <-"Hair.Cortisol.18.months..pg.mg.hair."
+
+# Behavior data
+behavior <- read.xlsx(behaviorFile,1)
+
+# Methylation data
+load(processeddata)
+b.values <- b
+m.values <- m
+
+rm(b,m)
+```
+
+## Gap probes in DMPs 
+
+```{r gapprobes}
+dmps <- dmps.fost
+
+annot.dmps <- annot[dmps,]
+dmps <- cbind(dmps,annot.dmps[,c(15:17)])
+dmps.gap.nmode <- dmps[!dmps$nmode==1,]
+dmps.gap.methyl <-  dmps[!dmps$methyl==0,]
+dmps.gap.hunt <-  dmps[!dmps$hunt==1,]
+dmps.gap <- dmps[!dmps$nmode==1|!dmps$methyl==0|!dmps$hunt==1,]
+```
+
+Of the `r nrow(dmps)` DMPs, there are `r nrow(dmps.gap)` (`r round(nrow(dmps.gap) / nrow(dmps) * 100)`%) probes flagged as potential gap probes, of which `r nrow(dmps.gap.nmode)` by nmode, `r nrow(dmps.gap.methyl)` by MethylToSNP and `r nrow(dmps.gap.hunt)` by gaphunter. 
+
+## Select and combine year 2 data
+
+### Preprocess cortisol data
+
+```{r transform-cortisol}
+cort.blood$AM <- log10(cort.blood$AM)
+cort.blood$PM <- log10(cort.blood$PM)
+cort.blood$NITE <- log10(cort.blood$NITE)
+cort.blood$AM.DEX <- log10(cort.blood$AM.DEX)
+cort.blood$PM.DEX <- log10(cort.blood$PM.DEX)
+cort.hair$Hair.Cortisol.18.months..pg.mg.hair. <- log10(cort.hair$Hair.Cortisol.18.months..pg.mg.hair.)
+```
+
+All cortisol data is log-transformed, as this improves the distribution of the values.
+
+### Select year 2 data
+
+```{r select-data}
+# Blood cortisol data
+cort.blood <- cort.blood[cort.blood$Age=="18 mo",]
+cort.blood <- cort.blood[1:nrow(cort.blood),c(1:7,9:13)]
+colnames(cort.blood) <- c("Subject", "DOB", "Cohort","Sex","Foster_mother","Bio_mother","Rank_foster","CortB_AM","CortB_PM","CortB_NITE","CortB_AM.DEX","CortB_PM.DEX")
+rownames(cort.blood) <- c(1:nrow(cort.blood))
+
+# Hair cortisol data
+cort.hair <- cort.hair[1:nrow(cort.hair),c(1:7,11)]
+# cort.hair <- cort.hair[-which(is.na(cort.hair$Subject)),]
+colnames(cort.hair) <- c("Subject", "Cohort", "Sex","Foster_mother","Bio_mother","Location","Rank","CortH")
+rownames(cort.hair) <- c(1:nrow(cort.hair))
+
+# Behavior data
+behavior <- behavior[,c(1,22,30,37,38)]
+
+# Methylation data
+rownames(dmps.results.fost) <- dmps.results.fost$probe
+mvalues.fost <- t(m.values[rownames(dmps.results.fost),])
+ids <- pd[rownames(mvalues.fost),c("Basename","animal_code")]
+mvalues.fost <- as.data.frame(mvalues.fost)
+mvalues.fost$Subject <- ids$animal_code
+```
+
+There are `r nrow(cort.blood)` samples in the blood cortisol data, `r nrow(cort.hair)` samples in the hair cortisol data and `r nrow(mvalues.fost)` samples in the methylation data.
+
+### Combine data 
+
+```{r combine-data}
+data <- merge(cort.blood,cort.hair,by="Subject")
+data <- data[,c(1:7,17,8:12,19)]
+colnames(data)[colnames(data) %in% c("Cohort.x","Sex.x","Foster_mother.x","Bio_mother.x")] <- c("Cohort","Sex","Foster_mother","Bio_mother")
+data <- merge(data,behavior,by="Subject")
+
+# Add variable for combination of biological and foster mother
+data$mothers <- as.factor(paste0(data$Bio_mother, "_", data$Foster_mother))
+levels(data$mothers) <- list("BC_FC"="CONTROL_CONTROL", "BM_FC"="MALT_CONTROL", "BC_FM"="CONTROL_MALT","BM_FM"="MALT_MALT")
+
+data <- data[,c(1:8,19,9:18)]
+rownames(data) <- data$Subject
+
+data$Cohort <- as.factor(data$Cohort)
+data$Sex <- as.factor(data$Sex)
+data$Bio_mother <- as.factor(data$Bio_mother)
+data$Foster_mother <- as.factor(data$Foster_mother)
+data$Rank_foster <- as.factor(data$Rank_foster)
+
+levels(data$Foster_mother)[levels(data$Foster_mother)=="CONTROL"] <- "CTRL"
+```
+
+```{r create-dataframe-fost}
+data.fost <- merge(data,mvalues.fost,by="Subject")
+rownames(data.fost) <- data.fost$Subject
+dim(data.fost)
+```
+
+There are `r nrow(data.fost)` samples in the combined data of cortisol, demographics and methylation values for the DMPs with foster mother as predictor, of which `r length(which(complete.cases(data.fost)))` are complete.
+
+```{r adapt-dataframe}
+data <- data[data$Subject %in% data.fost$Subject,]
+```
+
+## Cortisol data
+
+### Plot group differences
+
+
+```{r plot-thesis1,fig.height=4,fig.width=9}
+par(mfrow=c(3,2))
+
+for(i in 10:15){
+boxplot(data[,i] ~ data$Foster_mother, 
+        main = paste0(colnames(data[i])," levels at yr 2 (foster mother)"),
+        xlab="Group", ylab="Cortisol (pg/mL, log-transformed)", 
+        col=c("green", "red"))
+   stripchart(data[,i] ~ data$Foster_mother, vertical = TRUE, data = data, method = "jitter", add = TRUE, pch = 20, col = 'black')
+}
+
+dev.off()
+
+
+df <- data %>%
+  group_by(data$Foster_mother) %>%
+  summarise_at(vars(-c(1:9)), list(~ mean(., na.rm=TRUE)))
+
+df <- round(df[,2:ncol(df)], 2)
+rownames(df) <- c("CTRL","MALT")
+
+kable(df) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "left")
+```
+
+There seems to be a difference in PM blood cortisol levels at year 2 with different foster mother groups. There does not seem to be a big difference in other blood cortisol or hair cortisol levels.
+
+### Test group differences
+
+Columns 'norm.malt.p' and 'norm.control.p' indicate the p-values of the Shapiro-Wilk test for the MALT and CTRL groups, respectively. When this value is higher than 0.05, this indicates a normal distribution.
+
+Column 'var.p' indicates the p-value of the variance test. When this value is higher than 0.05, this indicates equal variance.
+
+Column 'ttest.p' indicates the p-value of the t-test. When this value is lower than 0.05, this indicates a significant effect. This is the case for **`r length(which(results$ttest.p<0.05))` variable(s): `r rownames(results[which(results$ttest.p<0.05),])`.**
+
+Column 'wilcox.p' indicates the p-value of the Wilcoxon Rank-sum test, which is applied when conditions for the t-test are not met. When this value is lower than 0.05, this indicates a significant effect. This is the case for **`r length(which(results$wilcox.p<0.05))` variable(s): `r rownames(results[which(results$wilcox.p<0.05),])`.**
+
+Bold values indicate which test was used (t-test or Wilcoxon).
+
+```{r test-cortisol-fost,warning=FALSE}
+# Test normal distribution
+result <- lapply(data[,c("CortB_AM", "CortB_PM", "CortB_NITE","CortB_AM.DEX","CortB_PM.DEX","CortH")], function(x) with(data,shapiro.test(x[Foster_mother=="MALT"])))
+
+norm.malt <- data.frame(p.value = sapply(result, getElement, name = "p.value"))
+
+result <- lapply(data[,c("CortB_AM", "CortB_PM", "CortB_NITE","CortB_AM.DEX","CortB_PM.DEX","CortH")], function(x) with(data,shapiro.test(x[Foster_mother=="CTRL"])))
+
+norm.control <- data.frame(p.value = sapply(result, getElement, name = "p.value"))
+
+# Test variance
+result <- lapply(data[,c("CortB_AM", "CortB_PM", "CortB_NITE","CortB_AM.DEX","CortB_PM.DEX","CortH")], function(x) var.test(x ~ Foster_mother, data = data))
+
+var <- data.frame(p.value = sapply(result, getElement, name = "p.value"))
+
+# T-test
+result <- lapply(data[,c("CortB_AM", "CortB_PM", "CortB_NITE","CortB_AM.DEX","CortB_PM.DEX","CortH")], function(x) t.test(x ~ data$Foster_mother, var.equal = TRUE))
+
+result.t <- data.frame(p.value = sapply(result, getElement, name = "p.value"))
+
+# Non-parametric test
+result <- lapply(data[,c("CortB_AM", "CortB_PM", "CortB_NITE","CortB_AM.DEX","CortB_PM.DEX","CortH")], function(x) wilcox.test(x[data$Foster_mother=="MALT"],x[data$Foster_mother=="CTRL"],na.action=omit))
+
+result.np <- data.frame(p.value = sapply(result, getElement, name = "p.value"))
+
+# Make dataframe with results
+results <- cbind(norm.malt,norm.control,var,result.t,result.np)
+colnames(results) <- c("norm.malt.p","norm.control.p","var.p","ttest.p","wilcox.p")
+results <- round(results,3)
+
+results$ttest.p = cell_spec(results$ttest.p, color = ifelse(results$norm.malt.p > 0.05 & results$norm.control.p > 0.05 & results$var.p > 0.05 & results$ttest.p < 0.05, "red", "black"), bold = ifelse(results$norm.malt.p > 0.05 & results$norm.control.p > 0.05 & results$var.p > 0.05, TRUE, FALSE))
+
+results$wilcox.p = cell_spec(results$wilcox.p, color = ifelse(results$wilcox.p < 0.05, "red", "black"), bold = ifelse(results$norm.malt.p < 0.05 | results$norm.control.p < 0.05 | results$var.p < 0.05, TRUE, FALSE))
+
+kable(results,escape=F) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F, position = "left")  
+```
+
+We will continue using only the significant variable(s).
+
+## Test mediation 
+
+```{r create-mediate-function}
+test.mediators <- function(data,cortisol,probe,subject){
+  fit <- lm(probe ~ cortisol, data=data)
+  return(c(round(summary(fit)$coefficients[2,1],3),round(summary(fit)$coefficients[2,4],5)))
+}
+```
+
+### Identify potential mediators 
+
+Potential mediators are identified by running a linear model with cortisol predicting methylation values. If cortisol has a significant association with methylation of a certain probe (p < 0.05), this probe is classed as a potential mediator.
+
+```{r identify-pos-mediators-fost}
+pos.mediators <- NULL
+for(i in 16:ncol(data.fost)){
+  res <- test.mediators(data.fost,data.fost$CortB_PM,data.fost[,i],data.fost$Subject)
+  pvalue.cort <- res[2]
+  if(pvalue.cort < 0.05){
+    pos.mediators <- rbind(pos.mediators,cbind(colnames(data.fost[i]),res[1],res[2]))
+  }
+}
+```
+
+```{r print-pos-mediators-fost}
+pos.mediators <- as.data.frame(pos.mediators)
+colnames(pos.mediators) <- c("probe","estimate.cort","pvalue.cort")
+rownames(pos.mediators) <- c(1:nrow(pos.mediators))
+pos.mediators$estimate.cort <- as.numeric(pos.mediators$estimate.cort)
+pos.mediators$pvalue.cort <- as.numeric(pos.mediators$pvalue.cort)
+pos.mediators.fost <- pos.mediators
+
+annot.pos.mediators.fost <- annot[pos.mediators.fost$probe,]
+annot.pos.mediators.fost <- annot.pos.mediators.fost[,c(1,6:10)]
+annot.pos.mediators.fost$probe <- rownames(annot.pos.mediators.fost)
+annot.pos.mediators.fost <- merge(pos.mediators.fost,annot.pos.mediators.fost,by="probe")
+
+annot.pos.mediators.fost
+``` 
+
+There are **`r nrow(pos.mediators.fost)` probes** which qualify as potential mediators, as they have a significant association with maltreatment and cortisol levels in the blood.
+
+### Formal mediation analysis
+
+```{r test-mediation-fost,message=FALSE,warning=TRUE}
+# Select only data from potential mediators
+data.select <- data.fost[,pos.mediators.fost$probe]
+data.select <- cbind(data.fost[,1:15],data.select)
+data.select.na <- na.omit(data.select) # 5 subjects deleted here
+
+data.select.na$Foster_mother <- as.numeric(as.factor(data.select.na$Foster_mother))
+
+mediators <- data.frame()
+for(i in 1:nrow(pos.mediators.fost)){
+  set.seed(13)
+  probe <- data.select.na[,i+15]
+  model.m <- lm(probe ~ Foster_mother,data=data.select.na)
+  model.y <- lm(CortB_PM ~ probe + Foster_mother, data = data.select.na)
+  res <- mediate(model.m,model.y,sims=1000,boot=TRUE,treat="Foster_mother",mediator="probe")
+  if(res$d1.p < 0.05){
+    mediators <- rbind(mediators,cbind(colnames(data.select.na[i+15]), res$d1,res$d1.ci[1],res$d1.ci[2],res$d1.p))
+  plot(res,main=colnames(data.select.na[i+15]))
+  }
+}
+
+mediators
+```
+
+```{r print-mediators-fost}
+if(length(mediators) > 0){
+  colnames(mediators) <- c("probe","ACME.est","ACME.CI.lower","ACME.CI.upper","ACME.p")
+  rownames(mediators) <- c(1:nrow(mediators))
+  mediators$ACME.est <- round(as.numeric(mediators$ACME.est),3)
+  mediators$ACME.CI.lower <- round(as.numeric(mediators$ACME.CI.lower),3)
+  mediators$ACME.CI.upper <- round(as.numeric(mediators$ACME.CI.upper),3)
+  mediators$ACME.p <- as.numeric(mediators$ACME.p)
+  mediators$Bonf.p <- p.adjust(mediators$ACME.p, method="bonferroni", n= nrow(pos.mediators.fost))
+  mediators
+}
+
+mediators.fost.cort <- mediators
+```
+
+There are **`r nrow(mediators.fost.cort)` probes** which qualify as mediators, as they have an Average Causal Mediation Effect (ACME) of which the Confidence Interval (CI) does not include 0 and therefore a p-value lower than 0.05. 
+
+# Session info
+```{r session-info}
+devtools::session_info()
+```
